@@ -1,0 +1,126 @@
+name: Project-Provisioning-$(Date:yyyyMMdd)$(Rev:.r)
+
+parameters:
+  - name: projectName
+    displayName: "1. Project Name"
+    type: string
+    default: "New-App-Project"
+  - name: projectDescription
+    displayName: "2. Project Description"
+    type: string
+  - name: contributors
+    displayName: "3. Contributors (Comma separated emails)"
+    type: string
+    default: "user@company.com"
+
+trigger: none 
+
+variables:
+  - group: project-vg 
+  - name: organizationName
+    value: "rajnandhube"
+
+stages:
+- stage: PreCheck
+  displayName: "Validation & Pre-Check"
+  jobs:
+  - job: Validate
+    pool: { vmImage: 'ubuntu-latest' }
+    steps:
+    - powershell: |
+        $projName = "${{ parameters.projectName }}".Trim()
+        $org = "$(organizationName)"
+        $pat = "$env:ADO_PAT"
+
+        # 1. Format Validation (Regex)
+        # ADO projects cannot have special chars like / \ [ ] : | < > + = ; ? *
+        if ($projName -match '[\/\\\[\]:|<>+=;?*]') {
+            Write-Error "Invalid Project Name. Special characters are not allowed."
+            exit 1
+        }
+
+        # 2. Check if Project already exists (Avoids wasted Admin time)
+        $base64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$($pat)"))
+        $url = "https://dev.azure.com/$org/_apis/projects/$($projName)?api-version=6.0"
+        
+        try {
+            $check = Invoke-RestMethod -Uri $url -Method Get -Headers @{Authorization=("Basic $base64")}
+            if ($check.name -eq $projName) {
+                Write-Host "##vso[task.logissue type=error]Project '$projName' already exists!"
+                exit 1
+            }
+        } catch {
+            Write-Host "Project does not exist. Validation passed."
+        }
+      env: { ADO_PAT: $(AZURE_DEVOPS_PAT) }
+
+- stage: ApprovalStage
+  displayName: "Admin Review"
+  dependsOn: PreCheck
+  jobs:
+  - deployment: Wait_For_Admin
+    environment: 'Project-Creation-Gate' 
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: echo "Request verified and approved."
+
+- stage: CreationStage
+  displayName: "Provision & Setup"
+  dependsOn: ApprovalStage
+  jobs:
+  - job: CreateAndConfigure
+    pool: { vmImage: 'ubuntu-latest' }
+    steps:
+    - powershell: |
+        $org = "$(organizationName)".Trim()
+        $pat = "$env:ADO_PAT".Trim()
+        $projName = "${{ parameters.projectName }}".Trim()
+        $emails = "${{ parameters.contributors }}".Split(",")
+
+        # --- STEP 1: CREATE PROJECT ---
+        $jsonBody = @{
+            name = $projName
+            description = "${{ parameters.projectDescription }}"
+            capabilities = @{
+                versioncontrol = @{ sourceControlType = "Git" }
+                processTemplate = @{ templateTypeId = "b8a3a935-7e91-48b8-a94c-606d37c3e9f2" } 
+            }
+        } | ConvertTo-Json -Compress
+        $jsonBody | Out-File -FilePath body.json
+
+        $createResponse = curl -s -u ":$pat" -X POST "https://dev.azure.com/$org/_apis/projects?api-version=6.0" `
+                          -H "Content-Type: application/json" -d '@body.json'
+        
+        Write-Host "Project creation initiated..."
+        Start-Sleep -Seconds 15 # Wait for project to bake
+
+        # --- STEP 2: ADD CONTRIBUTORS ---
+        # Get the 'Contributors' Descriptor for this specific project
+        $groupsUrl = "https://vssps.dev.azure.com/$org/_apis/graph/groups?api-version=6.0-preview.1"
+        $allGroups = curl -s -u ":$pat" $groupsUrl | ConvertFrom-Json
+        $targetGroup = $allGroups.value | Where-Object { $_.displayName -eq "[$projName]\Contributors" }
+
+        if ($null -ne $targetGroup) {
+            foreach ($email in $emails) {
+                $email = $email.Trim()
+                Write-Host "Processing: $email"
+                
+                # Resolve Email to Descriptor
+                $searchUrl = "https://vssps.dev.azure.com/$org/_apis/graph/users?api-version=6.0-preview.1"
+                $users = curl -s -u ":$pat" $searchUrl | ConvertFrom-Json
+                $user = $users.value | Where-Object { $_.mailAddress -eq $email -or $_.principalName -eq $email }
+
+                if ($null -ne $user) {
+                    # Add User to Group
+                    $memberUrl = "https://vssps.dev.azure.com/$org/_apis/graph/memberships/$($user.descriptor)/$($targetGroup.descriptor)?api-version=6.0-preview.1"
+                    curl -s -u ":$pat" -X PUT $memberUrl
+                    Write-Host "Successfully added $email to Contributors."
+                } else {
+                    Write-Host "Warning: User $email not found in Organization."
+                }
+            }
+        }
+      displayName: "Create Project and Add Members"
+      env: { ADO_PAT: $(AZURE_DEVOPS_PAT) }
